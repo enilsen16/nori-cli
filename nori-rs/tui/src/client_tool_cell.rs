@@ -5,6 +5,7 @@ use std::time::Instant;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use textwrap::WordSplitter;
+use unicode_width::UnicodeWidthStr;
 
 use crate::client_event_format::format_artifacts;
 use crate::client_event_format::format_edit_tool_header;
@@ -16,8 +17,11 @@ use crate::client_event_format::is_invocation_redundant;
 use crate::client_event_format::relativize_paths_in_text;
 use crate::client_event_format::strip_code_fences;
 use crate::diff_render::create_diff_summary;
+use crate::exec_cell::CappedLines;
+use crate::exec_cell::cap_lines;
 use crate::exec_cell::compact_command;
 use crate::exec_cell::full_command_lines;
+use crate::exec_cell::hidden_lines_marker;
 use crate::exec_cell::last_output_line;
 use crate::exec_cell::reads_files;
 use crate::exec_cell::spinner;
@@ -41,6 +45,7 @@ pub(crate) struct ClientToolCell {
     animations_enabled: bool,
     start_time: Option<Instant>,
     tool_output: ToolOutput,
+    output_max_lines: Option<i32>,
 }
 
 impl ClientToolCell {
@@ -63,11 +68,17 @@ impl ClientToolCell {
             animations_enabled,
             start_time,
             tool_output: ToolOutput::default(),
+            output_max_lines: None,
         }
     }
 
     pub(crate) fn with_tool_output(mut self, tool_output: ToolOutput) -> Self {
         self.tool_output = tool_output;
+        self
+    }
+
+    pub(crate) fn with_output_max_lines(mut self, output_max_lines: Option<i32>) -> Self {
+        self.output_max_lines = output_max_lines;
         self
     }
 
@@ -165,7 +176,10 @@ impl ClientToolCell {
         }
     }
 
-    fn render(&self, width: u16, full: bool) -> Vec<Line<'static>> {
+    /// `max_lines` caps command output and generic tool text; see
+    /// `exec_cell::cap_lines`. Diffs and Exploring rows ignore it, and
+    /// `display_lines` passes it only for the full view.
+    fn render(&self, width: u16, full: bool, max_lines: Option<i32>) -> Vec<Line<'static>> {
         if self.is_exploring() {
             return self.render_exploring_lines(width, full);
         }
@@ -175,7 +189,7 @@ impl ClientToolCell {
                     None => spinner(self.start_time, self.animations_enabled),
                     Some(_) => step_bullet(&self.snapshot),
                 };
-                execute_lines(&self.snapshot, bullet, width, full)
+                execute_lines(&self.snapshot, bullet, width, full, max_lines)
             }
             ToolKind::Create | ToolKind::Edit | ToolKind::Delete | ToolKind::Move => {
                 self.render_edit_lines(width, full)
@@ -184,7 +198,7 @@ impl ClientToolCell {
             | ToolKind::Search
             | ToolKind::Fetch
             | ToolKind::Think
-            | ToolKind::Other(_) => self.render_generic_lines(),
+            | ToolKind::Other(_) => self.render_generic_lines(max_lines),
         }
     }
 
@@ -241,7 +255,8 @@ impl ClientToolCell {
         }
         for step in steps {
             if step.kind == ToolKind::Execute {
-                let lines = execute_lines(step, step_bullet(step), width.saturating_sub(2), true);
+                let lines =
+                    execute_lines(step, step_bullet(step), width.saturating_sub(2), true, None);
                 out.extend(prefix_lines(lines, "  ".into(), "  ".into()));
                 continue;
             }
@@ -257,19 +272,27 @@ impl ClientToolCell {
     }
 
     fn explore_step_label(&self, step: &ToolSnapshot, max_width: usize) -> Line<'static> {
-        let path =
-            |p: &std::path::Path| relativize_paths_in_text(&p.display().to_string(), &self.cwd);
-        let spans: Vec<Span<'static>> = match (&step.kind, &step.invocation) {
+        let path = |p: &std::path::Path| display_path(p, &self.cwd);
+        let mut spans: Vec<Span<'static>> = match (&step.kind, &step.invocation) {
             (ToolKind::Execute, Some(Invocation::Command { command })) => {
                 compact_command(command, max_width)
             }
-            (ToolKind::Read, Some(Invocation::Read { path })) => {
-                vec!["Read".cyan(), " ".into(), read_display_name(path).into()]
+            (ToolKind::Read, Some(Invocation::Read { path: file })) => {
+                // "Read " plus the path; a path too long for the row gives way
+                // to the file name, which says more than a cut-off folder.
+                let shown = path(file);
+                let shown = match file.file_name() {
+                    Some(name) if 5 + shown.width() > max_width => {
+                        name.to_string_lossy().to_string()
+                    }
+                    Some(_) | None => shown,
+                };
+                vec!["Read".cyan(), " ".into(), shown.into()]
             }
             (_, Some(Invocation::Search { query, path: dir })) => {
                 let mut spans = vec!["Search".cyan(), " ".into()];
                 spans.extend(query.clone().map(Span::from));
-                if let Some(dir) = dir {
+                if let Some(dir) = dir.as_deref().filter(|dir| *dir != self.cwd) {
                     spans.push(" in ".dim());
                     spans.push(path(dir).into());
                 }
@@ -290,6 +313,14 @@ impl ClientToolCell {
                 }
             }
         };
+        // Details are dropped whole rather than cut, so a count never shows
+        // as a misleading partial number.
+        if let Some(summary) = step.details.summary() {
+            let detail = format!(" · {summary}");
+            if spans.iter().map(Span::width).sum::<usize>() + detail.width() <= max_width {
+                spans.push(detail.dim());
+            }
+        }
         crate::bottom_pane::truncate_line(&Line::from(spans), max_width)
     }
 
@@ -351,7 +382,7 @@ impl ClientToolCell {
         lines
     }
 
-    fn render_generic_lines(&self) -> Vec<Line<'static>> {
+    fn render_generic_lines(&self, max_lines: Option<i32>) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let bullet = if self.is_active() {
             spinner(self.start_time, self.animations_enabled)
@@ -400,10 +431,14 @@ impl ClientToolCell {
             }
         }
 
-        for (idx, detail) in details.into_iter().enumerate() {
-            let prefix = if idx == 0 { "  └ " } else { "    " };
-            lines.push(Line::from(vec![prefix.dim(), detail.dim()]));
-        }
+        let details: Vec<Line<'static>> = details.into_iter().map(|d| d.dim().into()).collect();
+        let detail_lines = match cap_lines(&details, max_lines) {
+            CappedLines::All(all) => all.to_vec(),
+            CappedLines::Split { head, hidden, tail } => {
+                [head, &[hidden_lines_marker(hidden)], tail].concat()
+            }
+        };
+        lines.extend(prefix_lines(detail_lines, "  └ ".dim(), "    ".dim()));
 
         lines
     }
@@ -418,12 +453,13 @@ fn step_bullet(step: &ToolSnapshot) -> Span<'static> {
 }
 
 /// `• Ran <command>` plus output: the last output line in compact form, all
-/// of it in full form.
+/// of it in full form, or its head and tail when `max_lines` caps it.
 fn execute_lines(
     snapshot: &ToolSnapshot,
     bullet: Span<'static>,
     width: u16,
     full: bool,
+    max_lines: Option<i32>,
 ) -> Vec<Line<'static>> {
     let verb = if is_active_phase(&snapshot.phase) {
         "Running"
@@ -458,9 +494,20 @@ fn execute_lines(
     );
     let output_opts = RtOptions::new(output_width).word_splitter(WordSplitter::NoHyphenation);
     let mut wrapped = Vec::new();
-    for raw in output.lines() {
-        let line = codex_ansi_escape::ansi_escape_line(raw).dim();
-        push_owned_lines(&word_wrap_line(&line, output_opts.clone()), &mut wrapped);
+    let wrap = |raws: &[&str], wrapped: &mut Vec<Line<'static>>| {
+        for raw in raws {
+            let line = codex_ansi_escape::ansi_escape_line(raw).dim();
+            push_owned_lines(&word_wrap_line(&line, output_opts.clone()), wrapped);
+        }
+    };
+    let raw_lines: Vec<&str> = output.lines().collect();
+    match cap_lines(&raw_lines, max_lines) {
+        CappedLines::All(all) => wrap(all, &mut wrapped),
+        CappedLines::Split { head, hidden, tail } => {
+            wrap(head, &mut wrapped);
+            wrapped.push(hidden_lines_marker(hidden));
+            wrap(tail, &mut wrapped);
+        }
     }
     lines.extend(prefix_lines(wrapped, "  └ ".dim(), "    ".into()));
     lines
@@ -655,19 +702,24 @@ fn create_contextual_patch(
 
 impl HistoryCell for ClientToolCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.render(width, self.tool_output == ToolOutput::Full)
+        let full = self.tool_output == ToolOutput::Full;
+        self.render(width, full, self.output_max_lines.filter(|_| full))
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.render(width, true)
+        self.render(width, true, None)
     }
 }
 
 /// Display name for a Read path: the file name when there is one.
-fn read_display_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
+/// A path relative to the session working directory, or unchanged when it
+/// lies outside it.
+fn display_path(path: &std::path::Path, cwd: &std::path::Path) -> String {
+    match path.strip_prefix(cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 fn is_active_phase(phase: &crate::presentation::ToolPhase) -> bool {
@@ -678,6 +730,10 @@ fn is_active_phase(phase: &crate::presentation::ToolPhase) -> bool {
             | crate::presentation::ToolPhase::InProgress
     )
 }
+
+#[cfg(test)]
+#[path = "client_tool_cell_explore_tests.rs"]
+mod explore_tests;
 
 #[cfg(test)]
 mod tests {
@@ -742,6 +798,7 @@ mod tests {
             raw_input: Some(serde_json::json!({"command": command})),
             raw_output,
             owner_request_id: None,
+            details: Default::default(),
         }
     }
 
@@ -823,6 +880,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -889,6 +947,7 @@ mod tests {
             raw_input: None,
             raw_output: Some(serde_json::json!({"exit_code": 0, "stdout": ""})),
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.transcript_lines(80));
@@ -915,6 +974,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -944,6 +1004,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -977,6 +1038,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1008,6 +1070,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1042,6 +1105,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1076,6 +1140,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1114,6 +1179,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, cwd, false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1151,6 +1217,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, cwd, false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1213,6 +1280,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1254,6 +1322,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let mut cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/cwd"), false);
         cell.mark_exploring();
@@ -1298,6 +1367,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let snap2 = ToolSnapshot {
             call_id: "call-r2".into(),
@@ -1312,6 +1382,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
 
         let mut cell = ClientToolCell::new(snap1, PathBuf::from("/tmp/cwd"), false);
@@ -1343,6 +1414,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
 
         let mut cell = ClientToolCell::new(snap, PathBuf::from("/tmp/cwd"), false);
@@ -1372,6 +1444,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let mut cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/cwd"), false);
         cell.mark_exploring();
@@ -1430,6 +1503,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let mut cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/cwd"), false);
         cell.mark_exploring();
@@ -1470,6 +1544,7 @@ mod tests {
             raw_input: None,
             raw_output,
             owner_request_id: None,
+            details: Default::default(),
         }
     }
 
@@ -1526,6 +1601,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1656,6 +1732,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = cell.display_lines(80);
@@ -1685,6 +1762,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1719,6 +1797,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let raw_lines = cell.display_lines(80);
@@ -1768,6 +1847,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let raw_lines = cell.display_lines(80);
@@ -1813,6 +1893,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -1917,6 +1998,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, dir.path().to_path_buf(), false);
         std::fs::remove_file(&file_path).expect("remove file before render");
@@ -1953,6 +2035,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -2010,6 +2093,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/test-cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -2060,6 +2144,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/"), false);
         let lines = render_lines(&cell.transcript_lines(80));
@@ -2105,6 +2190,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/"), false);
         let lines = render_lines(&cell.transcript_lines(80));
@@ -2150,6 +2236,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -2182,6 +2269,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let cell = ClientToolCell::new(snapshot, PathBuf::from("/tmp/cwd"), false);
         let lines = render_lines(&cell.display_lines(80));
@@ -2212,6 +2300,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             owner_request_id: None,
+            details: Default::default(),
         };
         let mut cell = ClientToolCell::new(snap, PathBuf::from("/tmp/cwd"), false);
         cell.mark_exploring();

@@ -157,12 +157,16 @@ mod agent_status;
 mod api_key;
 mod context;
 mod delegation;
+mod explore_details;
 mod part10;
 mod part8;
 mod queue_list;
 mod queue_recall;
 mod session_title_envelope;
 mod skillsets_v2;
+mod terminal_title;
+mod thought_history;
+mod thought_status;
 
 /// Type `text` as key presses and let the composer settle them.
 pub(crate) fn type_text(chat: &mut ChatWidget, text: &str) {

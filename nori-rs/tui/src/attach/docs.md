@@ -55,6 +55,9 @@ The controller uses the [host follow-up operation](../../../cli/src/host/docs.md
 - [Rendering](render.rs) keeps role and connectivity visible beside the
   selected conversation or session list. Watchers receive the same content and
   permissions but must take control before sending mutations.
+- Consecutive thought chunks join, as sent, into one part whatever their
+  message ids, and render as the chat view's `ThoughtCell` block before the
+  answer that ends them. `[tui] thoughts_in_history = false` hides them.
 - The identity line under the header shows the selected session as
   `<agent> · <name> · <folder> · <status>` (the folder is
   `session_table::short_folder` of the row's `cwd`, omitted when an older host
@@ -220,8 +223,13 @@ The controller uses the [host follow-up operation](../../../cli/src/host/docs.md
   failed session with Ctrl+R while retaining its conversation identity.
 - Detach closes only the client. Session close, cancellation, and resume are
   explicit host commands, and a role handoff never closes the old controller.
-  `/close` sends ACP `session/close`, `/cancel` the `session/cancel`
-  notification, and `/resume` and Ctrl+R `session/resume` with the row's
+  For agent-started work, Ctrl+C preserves the draft and uses the same
+  controller-only request as `/cancel`, `_nori/session/cancel_observed`.
+  The host checks the observation ID against the active turn. Attach shows
+  delivery or confirmation failures and leaves any retry to the controller.
+  For a host-admitted prompt, `/cancel` sends the standard `session/cancel`
+  notification. `/close` sends ACP `session/close`, and `/resume` and Ctrl+R
+  send `session/resume` with the row's
   folder (`_nori/session/resume` for an older host whose rows carry no
   folder). A resumed session is attached to this connection, so the host
   also sends it plain `session/update` notifications and

@@ -42,6 +42,10 @@ pub(crate) enum QueuedPromptAction {
 #[derive(Debug)]
 pub(crate) enum HarnessAction {
     Cancel,
+    CancelExternal {
+        generation: SessionGeneration,
+        id: String,
+    },
     /// Take a queued prompt out of the queue before it is sent.
     ReclaimQueuedPrompt {
         event_id: String,
@@ -471,6 +475,9 @@ pub(crate) enum AppEvent {
 
     /// Set the TUI pinned plan drawer config setting.
     SetConfigPinnedPlanDrawer(bool),
+
+    /// Show agent thought text in history, or only in the working indicator.
+    SetConfigThoughtsInHistory(bool),
 
     /// Set width-resize transcript reflow.
     SetConfigResizeReflow(bool),

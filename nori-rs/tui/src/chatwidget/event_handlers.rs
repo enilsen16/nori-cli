@@ -49,7 +49,7 @@ impl ChatWidget {
                 nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
             ) => {
                 // Classify live proactive activity before projecting the same update for display.
-                if self.replay_source.is_none() {
+                if self.replay_source.is_none() && self.external_turn.is_none() {
                     self.handle_proactive_session_update(&notification.update);
                 }
                 let events = self
@@ -173,20 +173,20 @@ impl ChatWidget {
             )
     }
 
-    fn start_proactive_turn(&mut self) {
+    pub(super) fn start_proactive_turn(&mut self) {
         if !self.proactive_turn_active {
             self.proactive_turn_active = true;
             self.start_task_presentation(false);
         }
     }
 
-    fn separate_proactive_turn(&mut self) {
+    pub(super) fn separate_proactive_turn(&mut self) {
         self.record_proactive_assistant_message();
         self.proactive_turn_active = false;
         self.flush_answer_stream_with_separator();
     }
 
-    fn complete_proactive_turn(&mut self) {
+    pub(super) fn complete_proactive_turn(&mut self) {
         if self.proactive_turn_active {
             self.record_proactive_assistant_message();
             self.proactive_turn_active = false;
@@ -205,6 +205,11 @@ impl ChatWidget {
         match event {
             nori_protocol::NoriEvent::SessionStarted(started) => {
                 self.on_session_started(started);
+            }
+            nori_protocol::NoriEvent::ExternalTurnChanged(turn) => {
+                if self.replay_source.is_none() {
+                    self.on_external_turn_changed(turn);
+                }
             }
             nori_protocol::NoriEvent::SessionPhaseChanged(phase) => {
                 // A local request boundary separates statusless proactive output without completing it.
@@ -239,6 +244,17 @@ impl ChatWidget {
                 self.handle_delegation_changed(delegation);
             }
             nori_protocol::NoriEvent::SessionEnded(ended) => {
+                let pending = self.external_cancel_status().is_some();
+                if self.external_turn.take().is_some() {
+                    self.separate_proactive_turn();
+                    self.bottom_pane.hide_status_indicator();
+                    if pending {
+                        self.add_info_message(
+                            "Session ended. Cancellation was not confirmed.".to_owned(),
+                            None,
+                        );
+                    }
+                }
                 if !self.session_configured_received {
                     self.bottom_pane.hide_status_indicator();
                 }
@@ -326,12 +342,14 @@ impl ChatWidget {
                 nori_protocol::HookOutputLevel::Error => self.on_error(output.message),
             },
             nori_protocol::NoriEvent::ReplayStarted(started) => {
+                self.flush_thought_block();
                 self.flush_answer_stream_with_separator();
                 self.flush_replay_message();
                 self.replay_source = Some(started.source);
             }
             nori_protocol::NoriEvent::ReplayFinished => {
                 self.flush_replay_message();
+                self.flush_thought_block();
                 self.replay_source = None;
             }
             nori_protocol::NoriEvent::Undo(_) | nori_protocol::NoriEvent::UserShell(_) => {}
@@ -450,6 +468,7 @@ impl ChatWidget {
     }
 
     pub(super) fn set_status_header(&mut self, header: String) {
+        let header = self.external_cancel_status().map_or(header, str::to_owned);
         self.current_status_header = header.clone();
         self.bottom_pane.update_status_header(header);
     }
@@ -489,24 +508,52 @@ impl ChatWidget {
         self.handle_streaming_delta(delta);
     }
 
+    fn end_thought_block(&mut self) {
+        self.reasoning_buffer.clear();
+        self.thought_status_text.clear();
+    }
+
     pub(super) fn on_agent_reasoning_delta(&mut self, delta: String) {
         self.flush_answer_stream_with_separator();
 
-        // For reasoning deltas, do not stream to history. Accumulate the
-        // current reasoning block and extract the first bold element
-        // (between **/**) as the chunk header. Show this header as status.
+        // Thought text is not streamed to history. The working indicator shows
+        // the current thought block's header; any other agent output ends the
+        // block, so the next thought replaces it.
+        // `reasoning_buffer` keeps the agent's text exactly. The indicator's
+        // copy also breaks the line before a whole `**subject**\ndescription`
+        // thought, because Gemini sends those with no separator.
+        if is_whole_heading_thought(&delta)
+            && !self.thought_status_text.is_empty()
+            && !self.thought_status_text.ends_with('\n')
+        {
+            self.thought_status_text.push('\n');
+        }
         self.reasoning_buffer.push_str(&delta);
+        self.thought_status_text.push_str(&delta);
+        // The block's supplied text goes to history unchanged once it ends.
+        self.push_thought_text(&delta);
 
-        if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
-            // Update the shimmer header to the extracted reasoning chunk header.
+        if let Some(header) = thought_status_header(&self.thought_status_text) {
             self.set_status_header(header);
-        } else {
-            // Fallback while we don't yet have a bold header: leave existing header as-is.
         }
         self.request_redraw();
     }
 
-    // Raw reasoning uses the same flow as summarized reasoning
+    /// Adds thought text to the block that goes to history when it ends,
+    /// unless thoughts stay in the working indicator only.
+    fn push_thought_text(&mut self, text: &str) {
+        if self.config.thoughts_in_history {
+            self.full_reasoning_buffer.push_str(text);
+        }
+    }
+
+    /// Ends the current thought block, adding it to history once.
+    pub(super) fn flush_thought_block(&mut self) {
+        let text = std::mem::take(&mut self.full_reasoning_buffer);
+        if let Some(cell) = history_cell::ThoughtCell::new(text) {
+            self.add_to_history(cell);
+        }
+    }
 
     pub(super) fn on_task_started(&mut self) {
         self.start_task_presentation(true);
@@ -525,8 +572,8 @@ impl ChatWidget {
             self.config.custom_working_messages,
             &self.config.custom_working_message_list,
         ));
-        self.full_reasoning_buffer.clear();
-        self.reasoning_buffer.clear();
+        self.flush_thought_block();
+        self.end_thought_block();
         self.completed_client_tool_calls.clear();
         self.assistant_stream_seen_for_stats = false;
         self.request_redraw();
@@ -552,6 +599,7 @@ impl ChatWidget {
     }
 
     fn finish_task_presentation(&mut self, last_agent_message: Option<String>, notify: bool) {
+        self.flush_thought_block();
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
 
@@ -582,6 +630,7 @@ impl ChatWidget {
 
     /// Finalize any active tool as failed and stop/clear running UI state.
     pub(super) fn finalize_turn(&mut self) {
+        self.flush_thought_block();
         self.flush_answer_stream_with_separator();
         self.finalize_active_cell_as_failed();
         self.pending_client_tool_cells.clear();
@@ -633,6 +682,7 @@ impl ChatWidget {
     /// Mirror the merged session title into the footer and the `/status` card.
     /// This is the part of a session-info update worth showing on every build,
     /// including the stable releases that suppress the metadata dump.
+    /// The terminal title follows it too.
     pub(super) fn publish_session_title(&mut self) {
         let title = self
             .session_info_state
@@ -647,6 +697,7 @@ impl ChatWidget {
             })
             .filter(|title| !title.is_empty());
         self.bottom_pane.set_session_title(title);
+        self.refresh_terminal_title();
     }
 
     pub(crate) fn on_undo_snapshots_loaded(&mut self, snapshots: Vec<nori_harness::UndoSnapshot>) {
@@ -791,6 +842,10 @@ impl ChatWidget {
             return;
         }
 
+        if self.can_control_external_turn() {
+            self.request_external_cancel();
+            return;
+        }
         if self.bottom_pane.is_task_running() {
             self.bottom_pane.show_ctrl_c_quit_hint();
             self.submit_harness_action(crate::app_event::HarnessAction::Cancel);
@@ -819,6 +874,8 @@ impl ChatWidget {
         match event {
             crate::presentation::ClientEvent::ApprovalRequest(_) => {}
             crate::presentation::ClientEvent::ToolSnapshot(tool_snapshot) => {
+                self.end_thought_block();
+                self.flush_thought_block();
                 self.handle_client_tool_snapshot(tool_snapshot);
             }
             crate::presentation::ClientEvent::MessageDelta(message_delta) => {
@@ -911,6 +968,7 @@ impl ChatWidget {
                 if message_delta.delta.is_empty() {
                     return;
                 }
+                self.flush_thought_block();
 
                 let continues_active_message =
                     self.active_user_message_id == message_delta.message_id
@@ -935,6 +993,8 @@ impl ChatWidget {
                 self.request_redraw();
             }
             crate::presentation::MessageStream::Answer => {
+                self.end_thought_block();
+                self.flush_thought_block();
                 self.assistant_stream_seen_for_stats = true;
                 self.on_agent_message_delta(message_delta.delta)
             }
@@ -945,6 +1005,7 @@ impl ChatWidget {
     }
 
     fn handle_client_plan_snapshot(&mut self, plan_snapshot: crate::presentation::PlanSnapshot) {
+        self.flush_thought_block();
         self.on_plan_update(plan_snapshot_to_update_plan_args(plan_snapshot));
     }
 
@@ -1033,13 +1094,16 @@ impl ChatWidget {
     fn handle_replay_client_event(&mut self, event: crate::presentation::ClientEvent) {
         match event {
             crate::presentation::ClientEvent::MessageDelta(delta) => {
+                // Consecutive thought chunks form one block whatever their
+                // message ids, as they do live.
                 let same_message = self.replay_message.as_ref().is_some_and(|message| {
                     message.stream == delta.stream
-                        && match (&message.message_id, &delta.message_id) {
-                            (Some(current), Some(incoming)) => current == incoming,
-                            (None, None) => true,
-                            (Some(_), None) | (None, Some(_)) => false,
-                        }
+                        && (delta.stream == crate::presentation::MessageStream::Reasoning
+                            || match (&message.message_id, &delta.message_id) {
+                                (Some(current), Some(incoming)) => current == incoming,
+                                (None, None) => true,
+                                (Some(_), None) | (None, Some(_)) => false,
+                            })
                 });
                 if same_message {
                     if let Some(message) = self.replay_message.as_mut() {
@@ -1081,6 +1145,7 @@ impl ChatWidget {
         let Some(message) = self.replay_message.take() else {
             return;
         };
+        let ends_thought_block = message.stream == crate::presentation::MessageStream::Reasoning;
         let replay_entry = match message.stream {
             crate::presentation::MessageStream::User => {
                 crate::presentation::ReplayEntry::UserMessage { text: message.text }
@@ -1093,9 +1158,19 @@ impl ChatWidget {
             }
         };
         self.handle_client_replay_entry(replay_entry);
+        if ends_thought_block {
+            self.flush_thought_block();
+        }
     }
 
     fn handle_client_replay_entry(&mut self, replay_entry: crate::presentation::ReplayEntry) {
+        // Consecutive replayed thoughts form one block; anything else ends it.
+        if !matches!(
+            replay_entry,
+            crate::presentation::ReplayEntry::ReasoningMessage { .. }
+        ) {
+            self.flush_thought_block();
+        }
         match replay_entry {
             crate::presentation::ReplayEntry::UserMessage { text } => {
                 self.add_to_history(history_cell::new_user_prompt(text));
@@ -1105,8 +1180,7 @@ impl ChatWidget {
                 self.flush_answer_stream_with_separator();
             }
             crate::presentation::ReplayEntry::ReasoningMessage { text } => {
-                let cell = history_cell::new_reasoning_summary_block(text);
-                self.add_boxed_history(cell);
+                self.push_thought_text(&text);
             }
             crate::presentation::ReplayEntry::PlanSnapshot { snapshot } => {
                 self.add_to_history(history_cell::new_plan_update(
@@ -1281,7 +1355,8 @@ impl ChatWidget {
             self.config.cwd.clone(),
             self.config.animations,
         )
-        .with_tool_output(self.config.tool_output);
+        .with_tool_output(self.config.tool_output)
+        .with_output_max_lines(self.config.tool_output_max_lines);
         if is_new_exploring {
             cell.mark_exploring();
         }

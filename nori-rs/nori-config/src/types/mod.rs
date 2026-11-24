@@ -2196,8 +2196,16 @@ pub struct TuiConfigToml {
     /// How tool calls render inline (the transcript view is always full).
     pub tool_output: Option<ToolOutput>,
 
+    /// Most lines of command output and generic tool text shown inline.
+    /// Head and tail stay; 0 or less shows everything.
+    pub tool_output_max_lines: Option<i32>,
+
     /// Pin plan updates to a drawer in the viewport instead of history cells.
     pub pinned_plan_drawer: Option<bool>,
+
+    /// Show agent thought text as its own history block. When `false`,
+    /// thoughts appear only in the working indicator.
+    pub thoughts_in_history: Option<bool>,
 
     /// Show rotating custom messages while the agent is working.
     pub custom_working_messages: Option<bool>,
@@ -2332,6 +2340,8 @@ pub struct ProjectConfig {
     pub trust_level: Option<TrustLevel>,
     /// Inline tool output for this project; beats `[tui] tool_output`.
     pub tool_output: Option<ToolOutput>,
+    /// Inline line cap for this project; beats `[tui] tool_output_max_lines`.
+    pub tool_output_max_lines: Option<i32>,
 }
 
 /// Sessions allowed at once when `[tui] max_sessions` is not set.
@@ -2449,8 +2459,15 @@ pub struct NoriConfig {
     /// `tool_output` came from a `-c` override, which applies to this run only.
     pub tool_output_from_command_line: bool,
 
+    /// Most lines of command and generic tool text shown inline; `None` shows all.
+    pub tool_output_max_lines: Option<i32>,
+
     /// Pin plan updates to a drawer in the viewport instead of history cells.
     pub pinned_plan_drawer: bool,
+
+    /// Show agent thought text as its own history block. When `false`,
+    /// thoughts appear only in the working indicator.
+    pub thoughts_in_history: bool,
 
     /// Show rotating custom messages while the agent is working.
     pub custom_working_messages: bool,
@@ -2588,8 +2605,10 @@ impl Default for NoriConfig {
             skillset_per_session: false,
             file_manager: None,
             pinned_plan_drawer: false,
+            thoughts_in_history: true,
             tool_output: ToolOutput::default(),
             tool_output_from_command_line: false,
+            tool_output_max_lines: None,
             custom_working_messages: true,
             custom_working_message_list: Vec::new(),
             footer_segment_config: FooterSegmentConfig::default(),

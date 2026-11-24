@@ -167,6 +167,38 @@ The application event loop matches `SessionEvent::Acp` and
 
 - ACP notifications drive private message, thought, plan, tool, usage, mode,
   live config, capability, and available-command presentation.
+- While a thought block streams, the working indicator shows its latest
+  complete `**heading**` that starts a line, as Codex (`**Title**\n\nbody`) and Gemini (`**subject**\ndescription`)
+  write them. The thought text is kept exactly as the agent sent it. Gemini
+  sends each whole thought as one chunk with no separator, so the indicator's
+  own copy breaks the line before a chunk that is exactly one complete
+  heading alone on its line followed by a description. Token-streamed `**`
+  markers never break a line. While a
+  line-initial heading is still streaming, the indicator keeps its previous
+  text. Without headings it shows the first non-empty line with inline `**`
+  markers removed, so emphasis inside a plain sentence keeps the sentence.
+  Answer text or a tool update ends the block, so the next thought replaces
+  the indicator text. The header is shortened by terminal display columns at
+  grapheme boundaries, ending in `...`, so the elapsed time and interrupt hint
+  stay visible, unless fewer than 20 columns would remain for the header; then
+  the row clips at the terminal edge. The shimmer styles one grapheme cluster
+  per span, so emoji sequences render whole. The header rule is
+  `thought_status_header` in [`chatwidget/mod.rs`](src/chatwidget/mod.rs).
+- A thought block is a run of consecutive thought chunks, whatever their
+  message ids. Answer text, a tool or plan update, a user message, any other
+  history cell, or the end of the turn ends it for history. A block that
+  ends goes to history once as a [`ThoughtCell`](src/history_cell/thought.rs): the supplied chunks joined
+  exactly as sent, rendered as dim italic Markdown behind a `│` gutter so it
+  reads as an aside rather than as the answer. Nothing is inserted between
+  chunks, so the stored text matches what the agent server sent. Replay joins
+  consecutive replayed thought deltas and per-chunk `ReasoningMessage`
+  entries the same way, so live, replay, the Ctrl+T transcript, and
+  `nori attach` show the same blocks. `[tui] thoughts_in_history = false`
+  (the "Thoughts in History" row in `/settings`) keeps thought text in the
+  working indicator only: no history block, no transcript entry, and no block
+  in `nori attach`. Changing it affects thoughts that arrive afterwards.
+  Block boundaries are in
+  [`event_handlers.rs`](src/chatwidget/event_handlers.rs).
 - User input is rendered from the harness's canonical ACP
   `user_message_chunk` notifications, not inserted by the submitting widget.
   Chunks with one message id are accumulated into one user history cell, and
@@ -181,23 +213,19 @@ The application event loop matches `SessionEvent::Acp` and
   tool-call, or tool-update content starts or confirms unowned
   presentation. Without a status hint, a later locally owned prompt or load
   start flushes and separates that output without inventing completion.
-- The chat widget tracks local prompt ownership as
-  `owned_prompt_request_id` and keeps a separate private
-  `proactive_turn_active` presentation bit. The legacy identifier groups
-  unowned presentation or presentation of an agent-owned turn, plus statistics
-  and explicit-idle notifications. It does not set the bottom pane's
-  operational task-running flag, so Ctrl-C cancellation, interrupt hints, and
-  in-task command gating remain tied to locally owned requests. It never drives
-  queue, cancel, loop, ACP phase, or request state.
-- Ordinary metadata does not imply a turn. The Nori Sessions broker's optional
-  `_meta.nori.status` extension establishes an agent-owned turn only when no
-  locally owned prompt or load is active: exact `working` starts or confirms
-  the turn and exact `idle` ends it. The status affects presentation only;
-  unknown values remain ordinary session metadata. Known status-only frames
-  are hidden; a known status combined with `title` or `updated_at` still
-  displays those fields. This distinction lives in
-  [`event_handlers.rs`](src/chatwidget/event_handlers.rs) and
-  [`presentation/mod.rs`](src/presentation/mod.rs).
+- The chat widget uses `owned_prompt_request_id` for local prompt controls and
+  `proactive_turn_active` to group unowned output. For live agent-started work,
+  the harness supplies an observation ID through `ExternalTurnChanged`. A
+  controller can interrupt that turn with Esc or Ctrl-C. Follow-only attachments
+  can watch its progress. Queue controls and loop completion still follow the
+  local prompt. See [external cancellation](src/chatwidget/external_cancel.rs).
+- The working indicator shows **Cancel requested** until the harness reports
+  an outcome. A matching cancelled stop reason confirms cancellation. An idle
+  report alone ends the indicator and leaves cancellation unconfirmed. A new
+  turn or a lost connection also releases the previous turn’s interrupt control.
+- Recognized status-only `_meta.nori.status` frames are hidden. A status
+  combined with `title` or `updated_at` still displays those fields.
+  See [session event handling](src/chatwidget/event_handlers.rs).
 - Handroll's `_meta.nori.connection.status` extension is also presentation
   only. Exact `reconnecting` and `connected` status-only frames render as
   “Cloud connection lost. Reconnecting…” and “Cloud connection restored.”
@@ -240,6 +268,25 @@ The private modules under `tui/src/presentation/` assemble ACP streaming values
 into display cells and friendly labels. These view models are allowed to be
 lossy and UI-specific; they are not fed back into the harness or exported from
 `nori-protocol`.
+
+`ClientEventNormalizer` ([`presentation/mod.rs`](src/presentation/mod.rs))
+keeps one stored `acp::ToolCall` per call ID and rebuilds a `ToolSnapshot` from
+it on every update. Two details of that store matter:
+
+- Update-level `_meta` is deep-merged into the stored call's `meta` (nested
+  objects merge, other values replace). The Claude adapter sends its post-tool
+  report (`_meta.claudeCode.toolResponse`) as a separate update after
+  `completed`, and the merge keeps it alive across later updates. A report that
+  arrives after the cell has been flushed to history is not applied.
+- `ToolSnapshot.details` (`ToolDetails`, omitted from serialization when empty)
+  is recomputed from the stored call on each update. It holds read line spans
+  and search hit counts drawn only from structured fields: observed values
+  from the Claude adapter's `toolResponse` (Read, Grep, and Glob shapes), an
+  integer `rawOutput.lines`, or OpenCode-style `rawOutput.metadata` counts;
+  and requested values from `rawInput` offset/limit or start/end lines and a
+  location line past the first. Observed values win over requested ones. No
+  Nori `_meta` key is involved. `rawOutput.lines` also still produces the
+  separate "Read N lines" output artifact.
 
 #### Picker and overlay-menu presentation
 
@@ -577,17 +624,54 @@ chat widget passes it in through `with_tool_output`. `nori attach` builds cells
 without that setting and does not resolve project settings, so it falls back
 to `ToolOutput::default()` and always renders full.
 
+The chat widget also passes `NoriConfig::tool_output_max_lines` through
+`with_output_max_lines`. This optional cap affects only `display_lines` in the
+full inline view: Execute output, and the invocation and artifact detail lines
+of Fetch, Think, and Other calls. Read and Search calls, ListFiles
+invocations, and read-only commands route to Exploring rows (see
+`is_exploring_snapshot`), so they are never capped. The compact view ignores the cap for
+every kind of call, as do diffs, Exploring groups and their Execute steps,
+`transcript_lines`, and `nori attach`, which never sets it. The
+cap counts logical lines before wrapping. [`cap_lines`](src/exec_cell/output_cap.rs)
+splits the text into a head and a tail, and `hidden_lines_marker` builds the
+faint italic `┄ N lines hidden` row placed between them. A cap of N gives N - 1
+content lines plus that marker; the head gets the smaller half, so an odd line
+goes to the tail. A cap of 1 shows only the marker, output that fits is not
+changed (so the marker always hides at least two lines), and empty output shows
+nothing.
+
 Compact output is one scannable line per call: a status dot that is the only
 status indicator (green, red, or a spinner), `Ran`/`Running` plus a command
 summary with bold command names and arguments elided to `…`, and one `└` line
 holding the last non-blank output line. Read-only Execute calls join `Read`,
 `Search`, and list-files calls in one `Explored` group with read/search/failed
 counts; edits show only their header. The full view shows the highlighted
-command, all output, every exploring step, and diffs. Snapshot routing, the
+command, all output, every exploring step, and diffs.
+
+Each exploring step names its path relative to the session working directory
+by anchored prefix stripping: the working directory itself shows as `.`, paths
+outside it stay absolute, and a search scoped to the working directory omits
+the ` in <dir>` suffix. A step may append a dim ` · <summary>` such as
+`lines 40–120 of 845`, `12 matches in 4 files`, `250+ files`, or `no matches`.
+A `+` marks a lower bound: a Glob or legacy Grep list cut at a limit, or a
+search that reported `timedOut`. A search that found nothing but stopped early
+shows `no matches (incomplete)`, never `no matches`. Claude Code's Grep report
+is read per `mode`: in `content` mode `numFiles` is always 0 and
+`numLines`/`totalLines` count output lines (context included), so the row
+shows no count unless `totalLines` is 0; in `count` mode the totals cover every
+result even when `appliedLimit` trims the list; in `files_with_matches` mode
+`totalFiles` is the exact count before the limit.
+The summary comes from the snapshot's typed `ToolDetails`
+([`tool_details.rs`](src/presentation/tool_details.rs)), never from output
+text or file IO, so servers that send no structured fields get the bare row.
+When the row plus summary would exceed the compact width the summary is
+dropped whole, so a count is never shown cut mid-number, and a read path too
+long for a compact row falls back to its file name. Snapshot routing, the
 pending/completed bookkeeping, and exploring-group lifetime are described in
 [EXEC_CELL_LIFECYCLE.md](src/chatwidget/EXEC_CELL_LIFECYCLE.md).
 
-The transcript overlay ([`pager_overlay`](src/pager_overlay.rs)) caps each
+The transcript overlay ([`pager_overlay`](src/pager_overlay.rs)) keeps its own
+row cap, independent of `tool_output_max_lines`. It caps each
 cell's rows and marks the cut with a faint italic `┄ N more lines` row so it
 cannot be mistaken for output. The configured `open_transcript` key (Ctrl+T)
 and a fixed Ctrl+O alias open it. Ctrl+O is reserved for the transcript, so
@@ -618,7 +702,7 @@ assistant cell when the message finishes; user, tool, event, and assistant
 cells otherwise keep their semantic order.
 
 Assistant Markdown (live streaming, finalized-cell reflow, attach, and
-reasoning summaries) renders through
+thought blocks) renders through
 [`markdown_render`](src/markdown_render.rs), which splits the source into prose
 and GFM table segments ([`table_segments`](src/markdown_render/table_segments.rs)).
 Tables go through the shared `nori_tui_components::Markdown` renderer and prose
@@ -1507,6 +1591,21 @@ are applied on top and are never rewritten.
 the same value reaches the `title:` row of the `/status` card. Agents such as Pi title a session from its first prompt, which begins with
 Nori's context envelope; the presentation layer drops that envelope from the
 title and shows no title when the agent cut it off inside the envelope.
+
+The [terminal title](src/terminal_title.rs) (OSC 0) reads
+`agent · project · session`, for example
+`Claude Code · harbor-ledger · Fix login flakes`, led by a spinner frame while
+a turn is working and animations are on. The agent is the display name the
+footer shows (a custom agent's own name), the project is the working
+directory's last segment, and the session is the first non-blank line of the
+same cleaned agent title, else of the widget's first prompt. Until a session
+has either, the title is the project alone. The agent is cut to 12 columns,
+the project to 16 and the session to 60, each by display width with `…`, so
+the session title keeps most of a narrow tab. Every part is sanitized first:
+whitespace becomes single spaces, control, bidi and zero-width characters are
+dropped, and the zero-width joiner stays so emoji sequences survive. Renames
+rewrite the title at once; a parked session never writes it, and the session
+brought on screen writes its own.
 
 Custom formats are deliberately limited to literal text and built-in
 placeholders. `{{` and `}}` emit literal braces. Unknown placeholders,
